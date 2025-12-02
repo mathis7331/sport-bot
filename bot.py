@@ -1,413 +1,477 @@
+import os
+import random
+import datetime
+from typing import Dict, List, Tuple
+
 import discord
 from discord.ext import commands
-import os
-import datetime
-import re
-import psycopg2
-from psycopg2.extras import RealDictCursor
 
-# ================== CONFIGURATION & SÉCURITÉ ==================
+# ================== CONFIG BOT ==================
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Vérification critique au démarrage
 if not TOKEN:
-    raise SystemExit("❌ ERREUR FATALE : La variable DISCORD_TOKEN est vide.")
-if not DATABASE_URL:
-    print("⚠️ ATTENTION : DATABASE_URL vide. Le bot ne pourra pas sauvegarder les données.")
+    # Sur Railway, ça s'affichera dans les logs si la variable n'est pas définie
+    raise SystemExit("DISCORD_TOKEN non défini dans les variables d'environnement.")
 
+PREFIX = "!"
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
 
-# ================== GESTION BASE DE DONNÉES (POSTGRESQL) ==================
+bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
-def get_db_connection():
-    """Crée une connexion sécurisée à la DB."""
-    try:
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-        return conn
-    except Exception as e:
-        print(f"❌ Erreur connexion DB: {e}")
-        return None
+# ================== OUTILS TEMPS & ALLURES ==================
 
-def init_db():
-    """Initialise les tables si elles n'existent pas."""
-    conn = get_db_connection()
-    if not conn: return
-    try:
-        cur = conn.cursor()
-        
-        # Table Profils (VMA, FC, etc.)
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS runners (
-                user_id BIGINT PRIMARY KEY,
-                vma FLOAT,
-                fcm INT,
-                fcr INT,
-                username TEXT
-            )
-        ''')
-        
-        # Table Records (PBs)
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS records (
-                user_id BIGINT,
-                distance VARCHAR(20), -- '5k', '10k', 'semi', 'marathon'
-                time_seconds INT,
-                date DATE,
-                PRIMARY KEY (user_id, distance)
-            )
-        ''')
-        
-        # Table Journal d'entraînement
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS logs (
-                id SERIAL PRIMARY KEY,
-                user_id BIGINT,
-                date DATE,
-                distance_km FLOAT,
-                duration_seconds INT,
-                comment TEXT
-            )
-        ''')
-        
-        conn.commit()
-        print("✅ Base de données PostgreSQL initialisée et prête.")
-    except Exception as e:
-        print(f"❌ Erreur init DB: {e}")
-    finally:
-        conn.close()
+def parse_time_to_seconds(time_str: str) -> int:
+    """mm:ss ou hh:mm:ss -> secondes"""
+    parts = time_str.strip().split(":")
+    if len(parts) == 2:
+        minutes, seconds = parts
+        hours = 0
+    elif len(parts) == 3:
+        hours, minutes, seconds = parts
+    else:
+        raise ValueError("Format invalide. Utilise mm:ss ou hh:mm:ss")
+    h = int(hours)
+    m = int(minutes)
+    s = int(seconds)
+    return h * 3600 + m * 60 + s
 
-# ================== LOGIQUE MÉTIER & VALIDATION (ANTI-CRASH) ==================
+def seconds_to_pace_str(seconds_per_km: float) -> str:
+    minutes = int(seconds_per_km // 60)
+    seconds = int(round(seconds_per_km % 60))
+    return f"{minutes:d}:{seconds:02d} /km"
 
-class TimeParser:
-    """Classe utilitaire pour gérer les temps de manière robuste."""
-    
-    @staticmethod
-    def parse(time_str: str) -> int:
-        """
-        Convertit 'hh:mm:ss' ou 'mm:ss' en secondes.
-        Gère les erreurs et les formats exotiques.
-        """
-        time_str = time_str.strip().replace("h", ":").replace("m", ":").replace("s", "")
-        parts = time_str.split(":")
-        
-        try:
-            parts = [int(p) for p in parts]
-        except ValueError:
-            raise ValueError("Format invalide. Utilise `mm:ss` (ex: 25:30) ou `hh:mm:ss`.")
+def format_time(seconds: float) -> str:
+    seconds = int(round(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    else:
+        return f"{m:d}:{s:02d}"
 
-        if len(parts) == 3: # hh:mm:ss
-            h, m, s = parts
-        elif len(parts) == 2: # mm:ss
-            h, m, s = 0, parts[0], parts[1]
-        else:
-            raise ValueError("Format inconnu. Essaie `mm:ss`.")
+def estimate_vma_from_5k(time_seconds: int) -> float:
+    """VMA approximative à partir du chrono 5 km (en secondes)."""
+    distance_km = 5.0
+    hours = time_seconds / 3600
+    speed_kmh = distance_km / hours
+    vma = speed_kmh / 0.92
+    return vma
 
-        total_seconds = h * 3600 + m * 60 + s
-        
-        # SANITY CHECK : Est-ce réaliste ?
-        if total_seconds > 172800: # Plus de 48h
-            raise ValueError("⏱️ Ce temps semble un peu... long (plus de 48h ?). Vérifie ta saisie.")
-        if total_seconds < 60: # Moins de 1 minute
-            raise ValueError("🚀 Moins d'une minute ? Tu es en avion de chasse ?")
-            
-        return total_seconds
+def estimate_vo2max_from_5k(time_seconds: int) -> float:
+    """Estim VO2max à partir du 5 km via Daniels."""
+    distance_m = 5000
+    speed_m_per_s = distance_m / time_seconds
+    speed_m_per_min = speed_m_per_s * 60
+    vo2 = -4.60 + 0.182258 * speed_m_per_min + 0.000104 * (speed_m_per_min ** 2)
+    return vo2
 
-    @staticmethod
-    def format(seconds: int) -> str:
-        """Affiche les secondes en format propre hh:mm:ss"""
-        if not seconds: return "--:--"
-        h = seconds // 3600
-        m = (seconds % 3600) // 60
-        s = seconds % 60
-        if h > 0:
-            return f"{h}:{m:02d}:{s:02d}"
-        return f"{m}:{s:02d}"
+def riegel_predict_time(t1_sec: int, d1_km: float, d2_km: float, exponent: float = 1.06) -> float:
+    """Prédiction de temps (Riegel)"""
+    return t1_sec * (d2_km / d1_km) ** exponent
 
-class Calculations:
-    """Moteur de calcul scientifique."""
-    
-    @staticmethod
-    def estimate_vma_from_race(distance_km: float, time_sec: float) -> float:
-        """Estimation VMA via formule de Léger/Mercier simplifiée."""
-        speed_kmh = distance_km / (time_sec / 3600)
-        # Formule empirique : VMA = Vitesse / %Soutien
-        # %Soutien dépend du temps d'effort.
-        # Pour faire simple : VMA est approx vitesse sur 6min.
-        # Ici on utilise un ratio standard pour le 5km (env 90-93% VMA pour débutant/inter)
-        if distance_km == 5:
-            return speed_kmh / 0.92
-        elif distance_km == 10:
-            return speed_kmh / 0.85
-        elif distance_km == 21.1:
-            return speed_kmh / 0.78
-        elif distance_km == 42.195:
-            return speed_kmh / 0.70
-        return speed_kmh # Fallback
+def pace_from_speed_kmh(speed_kmh: float) -> float:
+    """km/h -> secondes par km"""
+    speed_m_per_s = (speed_kmh * 1000) / 3600
+    return 1000 / speed_m_per_s
 
-    @staticmethod
-    def get_pace(vma: float, percentage: float) -> str:
-        target_speed = vma * (percentage / 100)
-        sec_km = 3600 / target_speed
-        return TimeParser.format(int(sec_km))
+# ================== PROFILS & JOURNAL UTILISATEURS ==================
 
-# ================== COMMANDES DISCORD ==================
+class RunnerProfile:
+    def __init__(self, vma: float = None, five_k_time: int = None, max_hr: int = None):
+        self.vma = vma
+        self.five_k_time = five_k_time
+        self.max_hr = max_hr
+
+# user_id -> RunnerProfile
+profiles: Dict[int, RunnerProfile] = {}
+
+# journal des séances simples : user_id -> List[(date_iso, description)]
+training_log: Dict[int, List[Tuple[str, str]]] = {}
+
+# ================== COMMANDES ==================
 
 @bot.event
 async def on_ready():
-    init_db()
-    print(f'🚀 Bot Sportif Pro connecté : {bot.user.name}')
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.competing, name="le marathon"))
+    print(f"✅ Connecté en tant que {bot.user} (ID: {bot.user.id})")
+    await bot.change_presence(activity=discord.Game(name="!help pour voir les commandes"))
 
-# --- 1. GESTION PROFIL ---
-
-@bot.command(name="set5k")
-async def set_5k(ctx, temps: str):
-    """Enregistre ton record 5km et met à jour ta VMA."""
-    try:
-        seconds = TimeParser.parse(temps)
-        
-        # Limite humaine (Record du monde ~12:35)
-        if seconds < 750: 
-            await ctx.send("🤨 Tu cours plus vite que le record du monde ? Je ne te crois pas.")
-            return
-
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # 1. Sauvegarder le record
-        cur.execute("""
-            INSERT INTO records (user_id, distance, time_seconds, date) 
-            VALUES (%s, '5k', %s, CURRENT_DATE)
-            ON CONFLICT (user_id, distance) DO UPDATE 
-            SET time_seconds = EXCLUDED.time_seconds, date = EXCLUDED.date
-        """, (ctx.author.id, seconds))
-        
-        # 2. Mettre à jour la VMA estimée
-        vma_estimee = Calculations.estimate_vma_from_race(5.0, seconds)
-        cur.execute("""
-            INSERT INTO runners (user_id, vma, username) VALUES (%s, %s, %s)
-            ON CONFLICT (user_id) DO UPDATE SET vma = %s, username = %s
-        """, (ctx.author.id, vma_estimee, ctx.author.name, vma_estimee, ctx.author.name))
-        
-        conn.commit()
-        conn.close()
-        
-        embed = discord.Embed(title="✅ Record 5km mis à jour", color=0x2ecc71)
-        embed.add_field(name="Temps", value=TimeParser.format(seconds), inline=True)
-        embed.add_field(name="Nouvelle VMA Estimée", value=f"{vma_estimee:.1f} km/h", inline=True)
-        await ctx.send(embed=embed)
-
-    except ValueError as e:
-        await ctx.send(f"❌ Oups : {str(e)}")
-    except Exception as e:
-        print(e)
-        await ctx.send("❌ Erreur base de données.")
-
-@bot.command(name="profil")
-async def profil(ctx, member: discord.Member = None):
-    """Affiche la carte d'athlète complète."""
-    target = member or ctx.author
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    # Récupérer infos runner
-    cur.execute("SELECT * FROM runners WHERE user_id = %s", (target.id,))
-    runner = cur.fetchone()
-    
-    # Récupérer records
-    cur.execute("SELECT distance, time_seconds FROM records WHERE user_id = %s", (target.id,))
-    records = {row['distance']: row['time_seconds'] for row in cur.fetchall()}
-    
-    conn.close()
-    
-    if not runner and not records:
-        await ctx.send(f"🤷‍♂️ Aucun profil trouvé pour {target.display_name}. Utilise `!set5k` pour commencer.")
-        return
-
-    embed = discord.Embed(title=f"👤 Profil Athlète : {target.display_name}", color=0x3498db)
-    embed.set_thumbnail(url=target.avatar.url if target.avatar else None)
-    
-    if runner:
-        vma = runner.get('vma', 0)
-        fcm = runner.get('fcm', 'N/A')
-        embed.add_field(name="⚡ VMA", value=f"**{vma:.1f} km/h**" if vma else "Non définie", inline=True)
-        embed.add_field(name="❤️ FC Max", value=f"{fcm} bpm", inline=True)
-
-    # Affichage des records
-    txt_records = ""
-    order = ['5k', '10k', 'semi', 'marathon']
-    for dist in order:
-        if dist in records:
-            txt_records += f"**{dist.upper()}**: {TimeParser.format(records[dist])}\n"
-            
-    if txt_records:
-        embed.add_field(name="🏆 Records Personnels", value=txt_records, inline=False)
-    
-    await ctx.send(embed=embed)
-
-# --- 2. CALCULS & ALLURES ---
-
-@bot.command(name="allures")
-async def allures(ctx):
-    """Génère un tableau d'allures basé sur la VMA."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT vma FROM runners WHERE user_id = %s", (ctx.author.id,))
-    res = cur.fetchone()
-    conn.close()
-    
-    if not res or not res['vma']:
-        await ctx.send("❌ Je ne connais pas ta VMA. Fais `!set5k [temps]` ou `!setvma [vitesse]`.")
-        return
-
-    vma = res['vma']
-    
-    embed = discord.Embed(title=f"🏃 Tes Allures (VMA {vma:.1f})", color=0xf1c40f)
-    
-    data = [
-        ("Jogging / Récup", 65, "60-65%"),
-        ("Endurance Fond.", 70, "70-75%"),
-        ("Allure Marathon", 80, "80-82%"),
-        ("Allure Semi", 85, "85-88%"),
-        ("Seuil (1h)", 90, "90%"),
-        ("VMA Courte", 105, "105%")
-    ]
-    
-    desc = ""
-    for name, pct, label in data:
-        pace = Calculations.get_pace(vma, pct)
-        desc += f"**{name}** ({label}) : `{pace}/km`\n"
-        
-    embed.description = desc
-    await ctx.send(embed=embed)
-
-# --- 3. LEADERBOARD (CLASSEMENT) ---
-
-@bot.command(name="leaderboard")
-async def leaderboard(ctx, distance="5k"):
-    """Affiche le top 10 du serveur sur une distance."""
-    if distance not in ['5k', '10k', 'semi', 'marathon']:
-        await ctx.send("❌ Distances valides : 5k, 10k, semi, marathon")
-        return
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    # Jointure pour avoir les noms (si stockés) ou juste l'ID
-    cur.execute("""
-        SELECT r.username, rec.time_seconds 
-        FROM records rec
-        JOIN runners r ON rec.user_id = r.user_id
-        WHERE rec.distance = %s
-        ORDER BY rec.time_seconds ASC
-        LIMIT 10
-    """, (distance,))
-    
-    rows = cur.fetchall()
-    conn.close()
-    
-    if not rows:
-        await ctx.send("🏜️ Le désert... Personne n'a enregistré de temps sur cette distance.")
-        return
-
-    embed = discord.Embed(title=f"🏆 CLASSEMENT {distance.upper()}", color=0xFFD700)
-    text = ""
-    for i, row in enumerate(rows):
-        medaille = "🥇" if i==0 else "🥈" if i==1 else "🥉" if i==2 else f"{i+1}."
-        text += f"{medaille} **{row['username']}** : {TimeParser.format(row['time_seconds'])}\n"
-    
-    embed.description = text
-    await ctx.send(embed=embed)
-
-# --- 4. OUTILS PHYSIO ---
-
-@bot.command(name="karvonen")
-async def karvonen(ctx):
-    """Calcule les zones cardiaques précises (Besoin FC Max + FC Repos)."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT fcm, fcr FROM runners WHERE user_id = %s", (ctx.author.id,))
-    res = cur.fetchone()
-    conn.close()
-
-    if not res or not res['fcm'] or not res['fcr']:
-        await ctx.send("❌ J'ai besoin de ta FC Max et FC Repos. Utilise `!setdata fcm 195` et `!setdata fcr 50`")
-        return
-        
-    fcm, fcr = res['fcm'], res['fcr']
-    reserve = fcm - fcr
-    
-    embed = discord.Embed(title="❤️ Zones Cardiaques (Karvonen)", description=f"FC Max: {fcm} | FC Repos: {fcr}", color=0xe74c3c)
-    
-    zones = [
-        ("Zone 1 (Récup)", 0.50, 0.60),
-        ("Zone 2 (Endurance)", 0.60, 0.70),
-        ("Zone 3 (Tempo)", 0.70, 0.80),
-        ("Zone 4 (Seuil)", 0.80, 0.90),
-        ("Zone 5 (Max)", 0.90, 1.00)
-    ]
-    
-    for name, low, high in zones:
-        bpm_low = int(fcr + (reserve * low))
-        bpm_high = int(fcr + (reserve * high))
-        embed.add_field(name=name, value=f"{bpm_low} - {bpm_high} bpm", inline=False)
-        
-    await ctx.send(embed=embed)
-
-@bot.command(name="setdata")
-async def set_data(ctx, type_donnee: str, valeur: int):
-    """Définit FC Max (fcm) ou FC Repos (fcr). Ex: !setdata fcm 190"""
-    if type_donnee not in ['fcm', 'fcr', 'vma']:
-        await ctx.send("❌ Types possibles : `fcm`, `fcr`, `vma`.")
-        return
-    
-    # Validation basique
-    if (type_donnee == 'fcm' and (valeur < 100 or valeur > 250)) or \
-       (type_donnee == 'fcr' and (valeur < 30 or valeur > 120)):
-       await ctx.send(f"🧐 La valeur {valeur} semble improbable pour {type_donnee}. Vérifie.")
-       return
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    sql = f"""
-        INSERT INTO runners (user_id, {type_donnee}, username) VALUES (%s, %s, %s)
-        ON CONFLICT (user_id) DO UPDATE SET {type_donnee} = %s, username = %s
-    """
-    cur.execute(sql, (ctx.author.id, valeur, ctx.author.name, valeur, ctx.author.name))
-    conn.commit()
-    conn.close()
-    
-    await ctx.send(f"✅ **{type_donnee.upper()}** mis à jour : {valeur}")
-
+# 1) HELP GLOBAL
 @bot.command(name="help")
-async def help_cmd(ctx):
-    embed = discord.Embed(title="🏃‍♂️ Coach Running Pro - Commandes", color=0x95a5a6)
-    embed.add_field(name="⚙️ Profil", value="`!set5k mm:ss` : Enregistre ton 5k (calcule ta VMA)\n`!setdata fcm/fcr [valeur]` : Règle ta FC Max/Repos\n`!profil` : Voir tes stats", inline=False)
-    embed.add_field(name="📈 Performance", value="`!allures` : Tes allures d'entraînement\n`!karvonen` : Tes zones cardiaques précises\n`!leaderboard 5k` : Classement du serveur", inline=False)
-    await ctx.send(embed=embed)
+async def help_command(ctx):
+    msg = (
+        "🏃‍♂️ **Commandes RUNNING dispo :**\n\n"
+        "__Profil & bases__\n"
+        "`!set5k mm:ss` → Enregistre ton chrono 5 km\n"
+        "`!setvma valeur` → Fixe ta VMA (km/h)\n"
+        "`!setmaxhr bpm` → Fixe ta FC max\n"
+        "`!profil` → Affiche ton profil coureur\n\n"
+        "__Calculs & allures__\n"
+        "`!vo2` → Estime ta VO2max (si 5 km enregistré)\n"
+        "`!vma` → Estime/affiche ta VMA\n"
+        "`!paces` → Tableau de tes allures d'entraînement\n"
+        "`!predict distance_km` → Prédiction de temps (5→10, semi, etc.)\n"
+        "`!zoneshr` → Zones cardio (si FC max définie)\n"
+        "`!zonespace` → Allures faciles / seuil / 10k / 5k\n\n"
+        "__Plans & séances__\n"
+        "`!plan5k niveau` → Plan 5 km 8 semaines (debutant/inter/avance)\n"
+        "`!plan10k niveau` → Plan 10 km 10 semaines\n"
+        "`!plan21k niveau` → Plan semi-marathon 12 semaines\n"
+        "`!session type` → Propose une séance (endurance/vma/seuil/fartlek/cotes)\n"
+        "`!taper distance_km` → Conseils de semaine d'affûtage avant course\n\n"
+        "__Suivi & mental__\n"
+        "`!log distance_km temps` → Ajoute une séance à ton journal\n"
+        "`!history [nb]` → Affiche tes dernières séances\n"
+        "`!raceday distance_km` → Routine jour de course (sommeil, repas, échauffement)\n"
+    )
+    await ctx.send(msg)
 
-# Démarrage
-bot.run(TOKEN)
-```
+# 2) SET 5K
+@bot.command(name="set5k")
+async def set5k_command(ctx, temps_5k: str):
+    try:
+        t = parse_time_to_seconds(temps_5k)
+    except ValueError as e:
+        await ctx.send(f"❌ {e}")
+        return
+    prof = profiles.get(ctx.author.id, RunnerProfile())
+    prof.five_k_time = t
+    if prof.vma is None:
+        prof.vma = estimate_vma_from_5k(t)
+    profiles[ctx.author.id] = prof
+    await ctx.send(f"✅ 5 km enregistré : **{temps_5k}**\nVMA estimée : **{prof.vma:.1f} km/h**")
 
-### 3️⃣ Pourquoi ce code est "Niveau Boss" ?
+# 3) SET VMA
+@bot.command(name="setvma")
+async def setvma_command(ctx, vma: float):
+    prof = profiles.get(ctx.author.id, RunnerProfile())
+    prof.vma = vma
+    profiles[ctx.author.id] = prof
+    await ctx.send(f"✅ VMA enregistrée : **{vma:.1f} km/h**")
 
-1.  **Gestion des Erreurs (Try/Except)** : Regarde la classe `TimeParser`. Si tu tapes `!set5k patate`, le bot ne plantera pas. Il te dira "Format invalide". Si tu tapes `!set5k 30:00` (alors que tu pensais 30 min mais le format est mm:ss), il convertit intelligemment. Si tu mets `!set5k 1000h`, il te dit "Temps irréaliste".
-2.  **Base de Données Relationnelle** : J'ai créé deux tables : `runners` (pour tes infos physiques) et `records` (pour tes chronos). C'est beaucoup plus propre que de tout mélanger.
-3.  **Commandes Intelligentes** :
-    * `!set5k` : Met à jour ton record ET recalcule automatiquement ta VMA.
-    * `!allures` : Se base sur la VMA en base de données.
-    * `!karvonen` : Utilise la formule de réserve cardiaque (beaucoup plus pro que juste le % de FC Max).
-    * `!leaderboard` : Crée une compétition saine sur le serveur.
+# 4) SET MAX HR
+@bot.command(name="setmaxhr")
+async def setmaxhr_command(ctx, max_hr: int):
+    prof = profiles.get(ctx.author.id, RunnerProfile())
+    prof.max_hr = max_hr
+    profiles[ctx.author.id] = prof
+    await ctx.send(f"✅ Fréquence cardiaque max enregistrée : **{max_hr} bpm**")
 
-### 4️⃣ Mise en place (Checklist finale)
+# 5) PROFIL
+@bot.command(name="profil")
+async def profil_command(ctx):
+    prof = profiles.get(ctx.author.id)
+    if not prof:
+        await ctx.send("ℹ️ Aucun profil trouvé. Commence par `!set5k mm:ss` ou `!setvma valeur`.")
+        return
+    desc = []
+    if prof.five_k_time:
+        desc.append(f"• 5 km : **{format_time(prof.five_k_time)}**")
+    if prof.vma:
+        desc.append(f"• VMA : **{prof.vma:.1f} km/h**")
+    if prof.max_hr:
+        desc.append(f"• FC max : **{prof.max_hr} bpm**")
+    if not desc:
+        await ctx.send("ℹ️ Profil vide. Utilise `!set5k`, `!setvma`, `!setmaxhr`.")
+        return
+    await ctx.send("👤 **Ton profil coureur :**\n" + "\n".join(desc))
 
-1.  Mets à jour ton `requirements.txt` sur ton Mac (et pour Railway) :
-    ```text
-    discord.py==2.3.2
-    psycopg2-binary
+# 6) VO2
+@bot.command(name="vo2")
+async def vo2_command(ctx):
+    prof = profiles.get(ctx.author.id)
+    if not prof or not prof.five_k_time:
+        await ctx.send("❌ Tu dois d'abord enregistrer un 5 km avec `!set5k mm:ss`.")
+        return
+    vo2 = estimate_vo2max_from_5k(prof.five_k_time)
+    await ctx.send(f"🧠 VO2max estimée : **{vo2:.1f} ml/kg/min** (approx)")
+
+# 7) VMA
+@bot.command(name="vma")
+async def vma_command(ctx):
+    prof = profiles.get(ctx.author.id)
+    if prof and prof.vma:
+        await ctx.send(f"🏃‍♂️ Ta VMA enregistrée/estimée est : **{prof.vma:.1f} km/h**")
+        return
+    if prof and prof.five_k_time:
+        vma = estimate_vma_from_5k(prof.five_k_time)
+        profiles[ctx.author.id].vma = vma
+        await ctx.send(f"🏃‍♂️ VMA estimée à partir du 5 km : **{vma:.1f} km/h**")
+        return
+    await ctx.send("❌ Tu dois d'abord mettre un 5 km (`!set5k`) ou une VMA (`!setvma`).")
+
+# 8) PACES
+@bot.command(name="paces")
+async def paces_command(ctx):
+    prof = profiles.get(ctx.author.id)
+    if not prof or not prof.vma:
+        await ctx.send("❌ Il me faut ta VMA (`!setvma` ou `!set5k`).")
+        return
+    vma = prof.vma
+    zones = {
+        "Endurance fondamentale (~60–70% VMA)": 0.65,
+        "Endurance active (~70–75% VMA)": 0.72,
+        "Allure marathon (~78–82% VMA)": 0.80,
+        "Allure seuil (~88–92% VMA)": 0.90,
+        "Allure 10 km (~95% VMA)": 0.95,
+        "Allure 5 km (~100–105% VMA)": 1.02,
+        "Fractionné court (105–110% VMA)": 1.08,
+    }
+    lines = []
+    for label, coef in zones.items():
+        speed = vma * coef
+        pace_sec = pace_from_speed_kmh(speed)
+        lines.append(f"- {label} : **{seconds_to_pace_str(pace_sec)}** (~{speed:.1f} km/h)")
+    await ctx.send("📏 **Tes allures d'entraînement (approx.) :**\n" + "\n".join(lines))
+
+# 9) PREDICT
+@bot.command(name="predict")
+async def predict_command(ctx, distance_km: float):
+    prof = profiles.get(ctx.author.id)
+    if not prof or not prof.five_k_time:
+        await ctx.send("❌ Tu dois d'abord enregistrer un 5 km avec `!set5k mm:ss`.")
+        return
+    base = prof.five_k_time
+    if distance_km <= 0:
+        await ctx.send("❌ Distance invalide.")
+        return
+    predicted = riegel_predict_time(base, 5.0, distance_km)
+    await ctx.send(
+        f"⏱️ Temps estimé sur **{distance_km:.1f} km** : **{format_time(predicted)}**\n"
+        "(Basé sur ton 5 km et le modèle de Riegel, approximatif)"
+    )
+
+# 10) ZONES HR
+@bot.command(name="zoneshr")
+async def zoneshr_command(ctx):
+    prof = profiles.get(ctx.author.id)
+    if not prof or not prof.max_hr:
+        await ctx.send("❌ Il me faut ta FC max (bpm) avec `!setmaxhr`.")
+        return
+    m = prof.max_hr
+    zones = [
+        ("Zone 1 (récup)", 0.50, 0.60),
+        ("Zone 2 (endurance)", 0.60, 0.70),
+        ("Zone 3 (tempo / seuil bas)", 0.70, 0.80),
+        ("Zone 4 (seuil / VO2)", 0.80, 0.90),
+        ("Zone 5 (anaérobie)", 0.90, 1.00),
+    ]
+    lines = []
+    for name, low, high in zones:
+        lines.append(f"- {name} : **{int(m*low)}–{int(m*high)} bpm**")
+    await ctx.send("❤️ **Tes zones cardio (approx.) :**\n" + "\n".join(lines))
+
+# 11) ZONES PACES SIMPLIFIEES
+@bot.command(name="zonespace")
+async def zonespace_command(ctx):
+    prof = profiles.get(ctx.author.id)
+    if not prof or not prof.vma:
+        await ctx.send("❌ Il me faut ta VMA (`!setvma` ou `!set5k`).")
+        return
+    vma = prof.vma
+    labels = {
+        "Footing très facile": 0.60,
+        "Footing normal": 0.70,
+        "Allure marathon": 0.80,
+        "Allure seuil": 0.90,
+        "Allure 10 km": 0.95,
+        "Allure 5 km": 1.02,
+    }
+    lines = []
+    for name, coef in labels.items():
+        spd = vma * coef
+        pace_sec = pace_from_speed_kmh(spd)
+        lines.append(f"- {name} : **{seconds_to_pace_str(pace_sec)}** (~{spd:.1f} km/h)")
+    await ctx.send("🏷️ **Résumé de tes allures clés :**\n" + "\n".join(lines))
+
+# 12) PLANS 5K / 10K / 21K (très simplifiés)
+
+def build_plan(distance: str, weeks: int, level: str) -> str:
+    level = level.lower()
+    if level not in ("debutant", "inter", "avance"):
+        level = "inter"
+    lines = [f"📅 Plan {distance} — {weeks} semaines — Niveau **{level}**"]
+    for w in range(1, weeks+1):
+        if level == "debutant":
+            lines.append(f"Semaine {w} : 3 séances (2 footings, 1 séance structurée légère)")
+        elif level == "avance":
+            lines.append(f"Semaine {w} : 5–6 séances (vma, seuil, allure {distance}, long)")
+        else:
+            lines.append(f"Semaine {w} : 4 séances (endurance, vma, seuil, sortie longue)")
+    lines.append("\nDétail complet à personnaliser selon ta fatigue/sensations.")
+    return "\n".join(lines)
+
+@bot.command(name="plan5k")
+async def plan5k_command(ctx, niveau: str = "inter"):
+    await ctx.send(build_plan("5 km", 8, niveau))
+
+@bot.command(name="plan10k")
+async def plan10k_command(ctx, niveau: str = "inter"):
+    await ctx.send(build_plan("10 km", 10, niveau))
+
+@bot.command(name="plan21k")
+async def plan21k_command(ctx, niveau: str = "inter"):
+    await ctx.send(build_plan("semi-marathon", 12, niveau))
+
+# 13) SESSION TYPE
+@bot.command(name="session")
+async def session_command(ctx, type: str = "random"):
+    type = type.lower()
+    options = ["endurance", "seuil", "vma", "fartlek", "cotes"]
+    if type not in options and type != "random":
+        await ctx.send("Types possibles : `endurance`, `seuil`, `vma`, `fartlek`, `cotes`, ou `random`.")
+        return
+    if type == "random":
+        type = random.choice(options)
+
+    if type == "endurance":
+        text = (
+            "🟢 **Séance endurance fondamentale**\n"
+            "- 45–60′ footing très facile (Z1–Z2)\n"
+            "- Tu dois pouvoir parler sans être essoufflé\n"
+            "- Objectif : construire le fond, récupérer"
+        )
+    elif type == "seuil":
+        text = (
+            "🟠 **Séance seuil**\n"
+            "- 20′ footing\n"
+            "- Puis 3 × 10′ à allure seuil (Z3) avec 3′ trot entre\n"
+            "- 10′ retour au calme\n"
+            "- Objectif : améliorer ta résistance à une allure soutenue"
+        )
+    elif type == "vma":
+        text = (
+            "🔺 **Séance VMA**\n"
+            "- 20′ footing\n"
+            "- 10 × 400m à ~100–105% VMA, récup 1′ trot\n"
+            "- 10′ retour au calme\n"
+            "- Objectif : monter ta vitesse max aérobie"
+        )
+    elif type == "fartlek":
+        text = (
+            "🌪️ **Séance fartlek libre**\n"
+            "- 20′ footing\n"
+            "- 8 à 12 × (1′ rapide / 1′ lent)\n"
+            "- Allure rapide proche 5 km, allure lente footing\n"
+            "- 10′ retour au calme\n"
+            "- Objectif : varier les allures, travailler la relance"
+        )
+    else:  # cotes
+        text = (
+            "⛰️ **Séance côte**\n"
+            "- 20′ footing\n"
+            "- 10 × 20–30″ en côte, récup en marchant en descente\n"
+            "- 10′ footing\n"
+            "- Objectif : puissance, gainage, foulée"
+        )
+    await ctx.send(text)
+
+# 14) TAPER (AFFÛTAGE)
+@bot.command(name="taper")
+async def taper_command(ctx, distance_km: float):
+    if distance_km <= 0:
+        await ctx.send("❌ Distance invalide.")
+        return
+    if distance_km <= 5:
+        msg = (
+            "🎯 **Affûtage 5 km (4–5 jours avant)**\n"
+            "- J-4 : séance allure course (3 × 5′ / récup 3′)\n"
+            "- J-3 : footing 30–40′ facile\n"
+            "- J-2 : repos ou 20′ très facile + 3 lignes droites\n"
+            "- J-1 : repos, hydratation, repas léger\n"
+        )
+    elif distance_km <= 10:
+        msg = (
+            "🎯 **Affûtage 10 km (7 jours)**\n"
+            "- Volume réduit de ~30–40%\n"
+            "- 1 séance allure 10k (ex : 3 × 8′)\n"
+            "- 1 séance légère de rappel VMA (ex : 6 × 200m)\n"
+            "- Le reste en footing facile\n"
+        )
+    elif distance_km <= 25:
+        msg = (
+            "🎯 **Affûtage semi-marathon (10–14 jours)**\n"
+            "- Réduire progressivement le volume (−30 à −40%)\n"
+            "- Garder un peu d'allure spécifique (ex : 3 × 3 km)\n"
+            "- Dernière sortie longue à J-10 environ\n"
+            "- Semaine de course : mostly footings faciles\n"
+        )
+    else:
+        msg = (
+            "🎯 **Affûtage marathon / longue distance**\n"
+            "- Taper sur 2–3 semaines\n"
+            "- Réduction progressive du volume (jusqu'à −50%)\n"
+            "- Garder quelques blocs allure marathon\n"
+            "- Beaucoup de sommeil, gestion du stress et de la nutrition\n"
+        )
+    await ctx.send(msg)
+
+# 15) LOG & HISTORY
+
+@bot.command(name="log")
+async def log_command(ctx, distance_km: float, temps: str):
+    try:
+        t = parse_time_to_seconds(temps)
+    except ValueError as e:
+        await ctx.send(f"❌ {e}")
+        return
+    date_str = datetime.date.today().isoformat()
+    desc = f"{date_str} — {distance_km:.1f} km en {format_time(t)}"
+    training_log.setdefault(ctx.author.id, []).append((date_str, desc))
+    await ctx.send(f"📝 Séance enregistrée : {desc}")
+
+@bot.command(name="history")
+async def history_command(ctx, nb: int = 5):
+    logs = training_log.get(ctx.author.id, [])
+    if not logs:
+        await ctx.send("📂 Aucun entraînement enregistré. Utilise `!log distance temps`.")
+        return
+    nb = max(1, min(nb, 20))
+    recent = logs[-nb:]
+    lines = [d for _, d in recent]
+    await ctx.send("📚 **Tes dernières séances :**\n" + "\n".join(lines))
+
+# 16) RACEDAY CONSEILS
+@bot.command(name="raceday")
+async def raceday_command(ctx, distance_km: float):
+    base = (
+        "🧠 **Routine jour de course :**\n"
+        "- Dors bien les 2–3 nuits AVANT la course\n"
+        "- Petit déjeuner facile à digérer 2–3h avant\n"
+        "- Hydrate-toi régulièrement mais sans abuser\n"
+        "- Arrive tôt sur place pour éviter le stress\n"
+        "- Échauffement progressif + quelques accélérations\n"
+        "- Ne pars pas trop vite, surtout au 1er km\n"
+    )
+    if distance_km <= 5:
+        spec = (
+            "\nSpécifique 5 km :\n"
+            "- Échauffement plus long (15–20′)\n"
+            "- Allure vite proche du max → prépare-toi mentalement à l'inconfort\n"
+        )
+    elif distance_km <= 10:
+        spec = (
+            "\nSpécifique 10 km :\n"
+            "- Vise une allure régulière du km 1 au km 8\n"
+            "- Si tu es bien, accélère légèrement sur les 2 derniers km\n"
+        )
+    elif distance_km <= 25:
+        spec = (
+            "\nSpécifique semi :\n"
+            "- Garde une allure contrôlée jusqu'au km 15\n"
+            "- Attention à la nutrition : un gel tous les 30–40′ peut aider\n"
+        )
+    else:
+        spec = (
+            "\nSpécifique longue distance :\n"
+            "- Gère ton allure dès le départ, le marathon commence après le 30e km\n"
+            "- Plan nutrition précis (eau + glucides régulièrement)\n"
+        )
+    await ctx.send(base + spec)
+
+# ================== LANCEMENT ==================
+
+if __name__ == "__main__":
+    bot.run(TOKEN)
